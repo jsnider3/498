@@ -7,6 +7,7 @@
 import Control.Parallel
 import Control.Monad.State
 import Data.List
+import qualified Data.Map as Map
 data Expr= N Int | F Float| Add Expr Expr | Mul Expr Expr | Sub Expr Expr
 	   | And Expr Expr | Or Expr Expr |Not Expr |If Expr Expr Expr |Equal Expr Expr| B Bool
 	   | Lam Type String Expr | App Expr Expr | Var String |Tuple[Expr]
@@ -27,9 +28,9 @@ data Type = TInt | TReal |TBool | Type :-> Type  |TTuple [Type] | TyL Type | TyR
 data Val = VB Bool | VTuple [Val] | VList Val Val |VNull | VL Val |VR Val|VDone|
 			VN Int |VF Float| VLam Expr |VRecord [(String,Expr)]|VTop|VBottom deriving (Show, Eq) --There's no VApp because applications can always be reduced further.
 
-
-type Env =[(String,Val)] --deriving (Show,Eq)
-type TEnv=[(String,Type)] --deriving(Show,Eq)	
+type Dict a  b =Map.Map a b
+type Env =Dict String Val --deriving (Show,Eq)
+type TEnv=Dict String Type --deriving(Show,Eq)	
 
 {-
 	typecheck ::Expr                  ->Type
@@ -78,7 +79,7 @@ typecheck (App lam var)= do
 					_ -> error "Application is done to a non-lambda."
 typecheck (Lam t s b)= do
 	env<-get
-	put $(s,t):env
+	put $(Map.insert s t env)
 	env<-get
 	case evalState(typecheck b)env of
 							(x)->if evalState(free(s,t))env then return(t:->x)else error "Attempt to change type of var."
@@ -145,7 +146,7 @@ typecheck(Lookup name)=do
 	(lookupType name)
 typecheck(Set ty name expr)=do
 	env<-get
-	if(subtype(evalState(typecheck expr)env)ty)then if evalState(free(name,ty))env then do {put $((name,ty):env);return TDone}else error "Attempt to change type of variable." else error $"Set is assigning a non"++show ty++" to a "++show ty++" variable."
+	if(subtype(evalState(typecheck expr)env)ty)then if evalState(free(name,ty))env then do {put $(Map.insert name ty env);return TDone}else error "Attempt to change type of variable." else error $"Set is assigning a non"++show ty++" to a "++show ty++" variable."
 typecheck(Record fields)= do
 	env<-get
 	return(TRecord $ zip(map fst fields)((zipWith evalState(map typecheck(map snd fields))(replicate (length fields)env))))
@@ -177,9 +178,13 @@ subtype a b=if(a==b) then True else False
 lookupType ::String->State TEnv Type
 lookupType st  = do
 	env<-get
-	case env of
+	case Map.lookup st env of
+		(Just x)->return x
+		_->error $"Variable "++show st++" not found in environment."
+	{-case env of
 		[]->error $"Variable "++show st++" not found in environment."
 		((s,v):rest)->if(st==s) then return v else do{return $evalState(lookupType st)rest}
+	-}
 {-
 	purgeEnv::Env->Expr->Env
 	Removes the lambda variables from the environment when it's removed by an application.
@@ -187,9 +192,8 @@ lookupType st  = do
 purgeEnv::Expr->State TEnv Bool
 purgeEnv(Lam t s b)=do
 	env<-get
-	case env of
-						[]->return True
-						(name,ty):rest->if(name==s)then do{put rest;return True} else do{put $(name,ty):(execState(purgeEnv(Lam t s b))rest);return True}
+	put $Map.delete s env
+	return True
 purgeEnv (Fix b)= purgeEnv(b)
 purgeEnv _=return False --error $"Attempt to purge something not part of an application. We have"++show thing
 {-
@@ -200,9 +204,15 @@ purgeEnv _=return False --error $"Attempt to purge something not part of an appl
 free::(String,Type)->State TEnv Bool
 free(s,t)=do
 	env<-get
-	case env of
+	case Map.lookup s env of
+		(Just ty)->return (t==ty)
+		_->return True
+		
+	return True
+	{-case env of
 					[]->return True
 					(name,ty):rest->if(name==s&&not(t==ty))then return False else do{put rest;free(s,t)}
+	-}
 {-
 	simplifyType ::Type -> Type
 	Takes type and either returns TReal or TBool depending on the root.
@@ -227,7 +237,7 @@ simplifyType(_)=TNull
 -}
 
 exec ::Expr ->Val
-exec(a)= evalState(typecheck a)[] `seq` (evalState(eval a )[])
+exec(a)= evalState(typecheck a)Map.empty `seq` (evalState(eval a )Map.empty)
 
 {-
 subst :: String -> Expr  ->      Expr
@@ -425,23 +435,28 @@ eval something = error $"No pattern to evaluate "++show something++"."
 setHelper::(String,Val)->State Env ()
 setHelper (name,val) = do
 	env<-get
-	case env of
+	put$Map.insert name val env
+	{-case env of
 		((s,v):rest)->if(name==s)
 							then put$(name,val):rest
 							else put$(s,v):(execState(setHelper (name,val))rest)
 		[]->put [(name,val)]
+		-}
 {-
 	lookupState ::String->State Env Val
 	Given the name of a variable either returns its value in the environment or crashes.
-
 -}	
 lookupState ::String->State Env Val
 lookupState st  = do
 	env<-get
-	case env of
+	case Map.lookup st env of
+		(Just x)->return x
+		_->error $"Variable "++show st++" not found in environment."
+		
+	{-case env of
 		[]->error $"Variable " ++show st++" not found in environment."
 		((s,v):rest)->if(st==s) then return v else do{return $evalState(lookupState st)rest}
-
+	-}
 
 {-
 	makeExpr :: Val   ->Expr
@@ -672,14 +687,14 @@ subtypeTests=[(TInt,TReal,True),(TReal,TReal,True),(TReal,TInt,False),(rec4T,rec
 				,(TTop,TBottom,False),(TBottom,TTop,True),(rec1T,rec4T,False)]
 
 -- are tests paired up with their actual results?
-testResults = map (\(t,v)-> evalState(eval t)[]==v) numTests
+testResults = map (\(t,v)-> evalState(eval t)Map.empty==v) numTests
 ----fst and snd
 pairTestResults = map (\(t,v)-> exec t==v) pairTests
 boolTestResults = map (\(t,v)-> exec t==v) boolTests
 funcTestResults = map (\(t,v)-> exec t==v) funcTests
 execTestResults = map (\(t,v)-> exec t==v) execTests
 subTestResults  = map (\(t,v)-> t==v) subTests
-typeTestResults = map (\(t,v)-> evalState(typecheck t)[]==v) typeTests
+typeTestResults = map (\(t,v)-> evalState(typecheck t)Map.empty==v) typeTests
 subtypeTestResults = map (\(t,r,v)-> subtype t r==v) subtypeTests
 
 
@@ -710,6 +725,6 @@ maybeWhile=Seq[Set TInt "cnt" (N 0) ,
 okay = (and testResults)&&(and boolTestResults)  &&  (and subTestResults)  &&  (and funcTestResults)  && (and typeTestResults)  &&(and pairTestResults) &&(and execTestResults)&&(and subtypeTestResults)
 
 main = do
-	putStrLn (show(evalState(eval (App factorial (N 3)))[]))
-	putStrLn (show(evalState(eval (App fibonacci (N 4)))[]))
+	putStrLn (show(evalState(eval (App factorial (N 3)))Map.empty))
+	putStrLn (show(evalState(eval (App fibonacci (N 4)))Map.empty))
 	putStrLn("okay is " ++show okay)
