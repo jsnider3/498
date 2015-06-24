@@ -1,31 +1,31 @@
---DEBUG THe way I'm using fix right now, it's not passing variables correctly.
-{-TODO Typecheck | eval
-TL/TR     Done   | Done
-Case      Done   | Done
-As        Done   | Done
-Fix       Done   | Done
-
--}
---For Pairs and Lists, Add, Mul, Sub, And, Or, and Not are done by performing the op on each element and building pairs/lists from the result.
-	--For Equals on the other hand the result is true if and only if every element is the same as the corresponding element or false.
---Lists of length 0 are disallowed by the typechecker.
-
+--LYAH 3,11,12
+--Real World Haskell 6,14
+--Changes since Project 6
+--Typecheck, free, lookupState, setHelper, lookupType, purgeEnv and eval now use the state monad.
+import Control.Parallel
+import Control.Monad.State
 data Expr= N Int | Add Expr Expr | Mul Expr Expr | Sub Expr Expr
-	   | And Expr Expr | Or Expr Expr |Not Expr |If Expr Expr Expr |Equal Expr Expr
+	   | And Expr Expr | Or Expr Expr |Not Expr |If Expr Expr Expr |Equal Expr Expr| B Bool
 	   | Lam Type String Expr | App Expr Expr | Var String |Tuple[Expr]
-	   | B Bool |List Expr Expr 
+	   |List Expr Expr 
 	   |Null --Null is the Unit Type
+	   |Done
 	   |Concat Expr Expr |Get Expr Expr |Head Expr |Rest Expr
 	   |Record [(String,Expr)] |GetRec String Expr 
-	   |Fix Expr|LetN[(String,Expr)] Expr | Func String 
+	   |Fix Expr|LetN[(String,Expr)] Expr  
 	   |TL Expr| TR Expr| Case Expr Expr Expr |As Expr Type 
+	   |Seq [Expr] |Set Type String Expr |Lookup String |While Expr Expr
            deriving(Show,Eq)
 		   
-data Type = TNum |TBool | Type :-> Type  |TTuple [Type] |TList Type Int |TRecord |TNull |TSum Type Type
+data Type = TNum |TBool | Type :-> Type  |TTuple [Type] | TyL Type | TyR Type |TList Type Int |TRecord |TNull |TSum Type Type|TDone
 		deriving (Show, Eq)
 
-data Val = VB Bool | VTuple [Val] | VList Val Val |VNull | VL Val |VR Val|
+data Val = VB Bool | VTuple [Val] | VList Val Val |VNull | VL Val |VR Val|VDone|
 			VN Int | VLam Expr |VRecord [(String,Expr)] deriving (Show, Eq) --There's no VApp because applications can always be reduced further.
+
+
+type Env =[(String,Val)] --deriving (Show,Eq)
+type TEnv=[(String,Type)] --deriving(Show,Eq)	
 
 {-
 	typecheck ::Expr                  ->Type
@@ -33,68 +33,160 @@ data Val = VB Bool | VTuple [Val] | VList Val Val |VNull | VL Val |VR Val|
 	Makes sure an expression uses types correctly and either returns 
 	a value of a single type or  returns an error.
 -}			
-typecheck ::Expr->[(String,Type)]->Type
-typecheck (N _)env=TNum
-typecheck (B _)env=TBool
-typecheck (Null)env=TNull
-typecheck (Add a b)env= if typecheck a env==typecheck b env&&simplifyType(typecheck b env)==TNum  then typecheck a env else error $"Invalid arguments for add. We have "++show (a,b)++"."
-typecheck (Mul a b)env= if typecheck a env==typecheck b env &&simplifyType(typecheck b env)==TNum  then typecheck a env else error $"Invalid arguments for mul. We have "++show (a,b)++"."
-typecheck (Sub a b)env= if typecheck a env==typecheck b env &&simplifyType(typecheck b env)==TNum  then typecheck a env else error $"Invalid arguments for sub. We have "++show (a,b)++"."
-typecheck (Or  a b)env= if typecheck a env==typecheck b env &&simplifyType(typecheck b env)==TBool then typecheck a env else error $"Invalid arguments for or.  We have "++show (a,b)++"."
-typecheck (And a b)env= if typecheck a env==typecheck b env &&simplifyType(typecheck b env)==TBool then typecheck a env else error $"Invalid arguments for and. We have "++show (a,b)++"."
-typecheck (If a b c)env= if typecheck a env==TBool 
-						then if typecheck b env ==typecheck c env 
-								then typecheck c env
+typecheck ::Expr->State TEnv Type --[(String,Type)]->([(String,Type)],Type)
+typecheck (N _)=return TNum
+typecheck (B _)=return TBool
+typecheck (Null)=return TNull
+typecheck (Equal _ _)= return TBool
+typecheck (Add a b)= typecheck (Sub a b)
+typecheck (Mul a b)= typecheck (Sub a b)
+typecheck (Sub a b)= do
+	env<-get
+	if evalState(typecheck a)env ==evalState(typecheck b)env &&simplifyType(evalState(typecheck b)env)==TNum  then typecheck a  else error $"Typecheck failure for arithmetic operation. We have "++show (a,b)++"."
+typecheck (Or  a b)= typecheck(And a b)
+typecheck (And a b)= do
+	env<-get
+	if evalState(typecheck a)env ==evalState(typecheck b)env &&simplifyType(evalState(typecheck b)env)==TBool  then typecheck a  else error $"Typecheck failure for boolean operation. We have "++show (a,b)++"."
+typecheck (If a b c)= do
+	env<-get
+	if evalState(typecheck a)env==TBool 
+						then if evalState(typecheck b)env  ==evalState(typecheck c)env &&  execState(typecheck b)env  ==execState(typecheck c)env
+								then typecheck c 
 								else error "Then/Else must be same type in if."
 						else error "Conditions for if must be boolean type"
-typecheck (Not a)env= if simplifyType(typecheck a env)==TBool then typecheck a env else error $"Typecheck failure for not. We have "++show a++"."
-typecheck (Tuple a)env = TTuple (zipWith typecheck a (replicate (length a)env))
-typecheck (Equal _ _)env= TBool
-typecheck (App lam var)env= case typecheck lam env of
-					(from :-> to)->if(typecheck var env==from) then to else error "Input to a lambda is of inappropriate type."
+typecheck (Not a)= do
+	env<-get
+	if simplifyType(evalState(typecheck a)env)==TBool then typecheck a  else error $"Typecheck failure for not. We have "++show a++"."
+typecheck (Tuple a) = do
+	env<-get
+	let temp=(map eval a)
+	return(TTuple (zipWith (evalState)(map typecheck a)(replicate (length a)env )))
+typecheck (App (Fix lam)var)=do
+	env<-get
+	case(evalState(typecheck (Fix lam))env)of
+								((from:->to):->(from1:->to1))->if(evalState(typecheck var )env==from&&from==from1&&to==to1) then do{put $execState(purgeEnv(lam))env; return to} else error $"Input to a lambda is of inappropriate type. We have "++show(evalState(typecheck var )env)++" but want "++show from++"."
+								_ -> error "Typecheck failed, at an Application to a fix."
+typecheck (App lam var)= do
+	env<-get
+	case (evalState(typecheck lam)env ) of
+					(from :-> to)->if(evalState(typecheck var)env==from) then do{put $execState(purgeEnv(lam))env; return to} else error $"Input to a lambda is of inappropriate type. We have "++show(evalState(typecheck var )env)++" but want "++show from++"."
 					_ -> error "Application is done to a non-lambda."
-typecheck (Lam t s b)env= t :-> (typecheck b ((s,t):env))
-typecheck (Concat a b)env=case (typecheck a env,typecheck b env) of
-							(TList type1 alen,TList type2 blen) ->if type1==type2 then TList type1 (alen+blen) else error "Can't concat lists of different types."
+typecheck (Lam t s b)= do
+	env<-get
+	put $(s,t):env
+	env<-get
+	case evalState(typecheck b)env of
+							(x)->if evalState(free(s,t))env then return(t:->x)else error "Attempt to change type of var."
+typecheck (Concat a b)=do
+	env<-get
+	case (evalState(typecheck a)env ,evalState(typecheck b)env ) of
+							(TList type1 alen,TList type2 blen) ->if type1==type2 then return(TList type1 (alen+blen)) else error "Can't concat lists of different types."
 							_ -> error "Can't concat non-lists."
-typecheck (Get index list)env=case(typecheck index env,typecheck list env) of
-							(TNum,TList type1 _)-> type1
+typecheck (Get index list)=do
+	env<-get
+	case(evalState(typecheck index)env ,evalState(typecheck list)env ) of
+							(TNum,TList type1 _)-> return(type1)
 							_ -> error "Get requires a list to work with."
-typecheck (Head a)env=case(typecheck a env) of
-						(TTuple (head:_))-> head
-						(TList type1 _)->type1
+typecheck (Head a)=do
+	env<-get
+	case evalState(typecheck a)env of
+						(TTuple (head:_))-> return(head)
+						(TList type1 _)->return(type1)
 						_ -> error "Head only works on pairs and lists."
-typecheck (Rest a)env=case(typecheck a env) of
-						(TTuple [_,rest])->rest
+typecheck (Rest a)=do
+	env<-get
+	case evalState(typecheck a)env of
+						(TTuple [_,rest])->return(rest)
 						(TList listType len)->case (a) of
-									(List _ Null) ->TNull --I'm not sure if I should return null if they try to call rest on the end of the list or crash.
-									(List _ _) -> TList listType (len-1)
+									(List _ Null) ->return(TNull) --I'm not sure if I should return null if they try to call rest on the end of the list or crash.
+									(List _ _) -> return(TList listType (len-1))
 						_ -> error "Rest only works on pairs and lists."
-typecheck (List head rest)env=case (typecheck head env) of
+typecheck (List head rest)=do
+	env<-get
+	case evalState(typecheck head)env of
 							(TNull) -> error "Lists cannot be headed by null."
 							(TList _ _)-> error "Lists cannot be headed by lists."
-							(goodType)->case (typecheck rest env) of
-										(TNull)->(TList goodType 1)
-										(TList goodtype len)->(TList goodtype (len+1))
-										(goodtype)-> error "List was terminated inappropriately."
-										_ -> error "Lists cannot be mixed type."
-typecheck (Fix (Lam t s b))env= (typecheck (Lam t s b)env):->(typecheck (Lam t s b)env)
-typecheck (Fix something)env=error$"Typecheck for fix failed. The body is "++show something++"."
-typecheck (Var st) env = lookupType st env
-typecheck (TL a) env = typecheck a env
-typecheck (TR b) env = typecheck b env
-typecheck (As expr ty) env = case (expr,ty) of
-								(TL a,TSum left right)->if(typecheck a env==left) then if(left==right) then error "Sums must be two different types." else TSum left right else error"Typecheck of as failed."
-								(TR b,TSum left right)->if(typecheck b env==right)then if(left==right) then error "Sums must be two different types." else TSum left right else error"Typecheck of as failed."
-typecheck (Case expr left right) env=case(typecheck expr env) of
-										TSum l r-> if(typecheck left env==typecheck right env)then typecheck left env else error$"Cases have different return types."
+							(goodType)->case evalState(typecheck rest )env of
+										(TNull)->return $TList goodType 1
+										(TList goodtype len)->return $TList goodtype (len+1)
+										(type2)-> if type2==goodType then error "List was terminated inappropriately." else error "Lists cannot be mixed type."
+typecheck (Fix (Lam t s b))= (typecheck (Lam t s b))-- :->(typecheck (Lam t s b))--DEBUG
+typecheck (Fix something)=error$"Typecheck for fix failed. The body is "++show something++"."
+typecheck (Var st) = do
+	env<-get
+	lookupType st
+typecheck (TL a)  =do
+	env<-get
+	return(TyL(evalState(typecheck a)env))
+typecheck (TR b)  =do
+	env<-get
+	return(TyR(evalState(typecheck b)env))
+typecheck (As expr ty)= do
+	env<-get
+	case (expr,ty) of
+								(TL a,TSum left right)->if(evalState(typecheck a)env==left) then if(left==right) then error "Sums must be two different types." else return(TSum left right) else error"Typecheck of as failed."
+								(TR b,TSum left right)->if(evalState(typecheck b)env==right)then if(left==right) then error "Sums must be two different types." else return(TSum left right) else error"Typecheck of as failed."
+typecheck (Case expr left right)=do
+	env<-get
+	case evalState(typecheck expr)env of
+										TSum l r-> case (evalState(typecheck left)env,evalState(typecheck right)env) of
+														(a:->b,c:->d)->if(b==d&&a==l&&c==r)then return b else error$"Typechecking failure for case lambda."
+														_->error$"Case doesn't have two lambdas."
 										_->error $"Case doesn't typecheck to sum."
-typecheck something env= error $"Can't typecheck "++show something
-lookupType ::String->[(String,Type)]->Type
-lookupType st ((s,t):env) = if(st==s) then t else lookupType st env
-lookupType st []= error $"Variable not found in environment."
+typecheck(Seq [a])=typecheck a 
+typecheck(Seq (a:b))=do
+	env<-get
+	put $execState(typecheck a)env
+	typecheck (Seq b)
+typecheck(While guard body)=do
+	env<-get
+	case evalState(typecheck guard)env of
+									(TBool)-> (typecheck body) `seq` return(TDone)
+									_->error $"Guard must be boolean"
+typecheck(Lookup name)=do
+	env<-get
+	(lookupType name)
+typecheck(Set ty name expr)=do
+	env<-get
+	if(ty==evalState(typecheck expr)env)then if evalState(free(name,ty))env then do {put $((name,ty):env);return TDone}else error "Attempt to change type of variable." else error $"Set is assigning a non"++show ty++" to a "++show ty++" variable."
+typecheck(Record fields)= return(TRecord) -- (map(map typecheck (map snd fields)) []) )
+typecheck(GetRec str (Record[(k,v)]))=if(k==str)then typecheck v  else error $"Record doesn't possess the specified field."
+typecheck(GetRec str (Record((k,v):record)))=if(k==str)then typecheck v  else typecheck(GetRec str (Record record))
+typecheck something = error $"Can't typecheck "++show something
 
-
+{-
+	lookupType ::String->TEnv->Type
+	Searches the environment and returns the type of the variable specified.
+-}
+lookupType ::String->State TEnv Type
+lookupType st  = do
+	env<-get
+	case env of
+		[]->error $"Variable "++show st++" not found in environment."
+		((s,v):rest)->if(st==s) then return v else do{return $evalState(lookupType st)rest}
+{-
+	purgeEnv::Env->Expr->Env
+	Removes the lambda variables from the environment when it's removed by an application.
+-}
+purgeEnv::Expr->State TEnv Bool
+purgeEnv(Lam t s b)=do
+	env<-get
+	case env of
+						[]->return True
+						(name,ty):rest->if(name==s)then do{put rest;return True} else do{put $(name,ty):(execState(purgeEnv(Lam t s b))rest);return True}
+purgeEnv (Fix b)= purgeEnv(b)
+purgeEnv _=return False --error $"Attempt to purge something not part of an application. We have"++show thing
+{-
+	free::(String,Type)->TEnv->Bool
+	Checks the environment to make sure that a given variable name is not already defined in the environment as having a different type. 
+	I thought of making it crash if you declared a variable twice with the same type, but that would have been both problematic and picky.
+-}
+free::(String,Type)->State TEnv Bool
+free(s,t)=do
+	env<-get
+	case env of
+					[]->return True
+					(name,ty):rest->if(name==s&&not(t==ty))then return False else do{put rest;free(s,t)}
 {-
 	simplifyType ::Type -> Type
 	Takes type and either returns TNum or TBool depending on the root.
@@ -118,7 +210,7 @@ simplifyType(_)=TNull
 -}
 
 exec ::Expr ->Val
-exec(a)= (typecheck a) `seq` (eval a)
+exec(a)= evalState(typecheck a)[] `seq` (evalState(eval a )[])
 
 {-
 subst :: String -> Expr  ->      Expr
@@ -128,9 +220,9 @@ subst :: String -> Expr  -> Expr -> Expr
 subst _ _ (N a)=(N a)
 subst _ _ (B a)=(B a)
 subst _ _ (Null)=Null
+subst _ _ (Lookup name)=Lookup name
 subst str rep body =case body of
 			Var st->if(st==str) then rep else (Var st)
-			Func name->if(name==str) then rep else (Func name)
 			Add arg1 arg2->Add (subst str rep arg1)(subst str rep arg2)
 			Mul arg1 arg2->Mul (subst str rep arg1)(subst str rep arg2)
 			Sub arg1 arg2->Sub (subst str rep arg1)(subst str rep arg2)
@@ -148,110 +240,182 @@ subst str rep body =case body of
 			List head rest->List (subst str rep head)(subst str rep rest)
 			Fix expr-> Fix (subst str rep expr)
 			As expr ty->As (subst str rep expr)ty
-			TL a->subst str rep a
-			TR b->subst str rep b
+			TL a->TL $ subst str rep a
+			TR b->TR $ subst str rep b
+			LetN things body-> LetN (zip(map fst things)(map(subst str rep)(map snd things))) (subst str rep body)  
+			Seq a -> Seq (map (subst str rep) a)
+			Set ty name a ->Set ty name (subst str rep a)
+			While guard body->While (subst str rep guard)(subst str rep body)
 			something ->error $ "Invalid body for substitution. We have " ++show something++" The string we're looking for is "++show str++" and the replacement is "++show rep++"."
 
 {-
 	eval ::Expr  ->Val
 		   input ->result
 -}
-eval :: Expr -> Val
 
-eval (N a) = VN a
-eval (Tuple a)=VTuple (map eval a)
-eval (B b)=VB b
-eval (Lam t str body)=VLam (Lam t str body)
-eval (List a b)=VList (eval a)(eval b)
-eval (Null)=VNull
+eval :: Expr -> State Env Val
+
+eval (N a) = return (VN a)
+eval (Tuple a)=do
+	env<-get
+	let temp=(map eval a)
+	--evalState(eval a)env
+	return(VTuple (zipWith (evalState)(map eval a)(replicate (length a)env )))
+--(zipWith typecheck a (replicate (length a)env))
+
+eval (B b)=return(VB b)
+eval (Lam t str body)=return(VLam (Lam t str body))
+eval (List a b)=do
+	env <-get
+	first<-eval a
+	s2nd<-eval b
+	return (VList (first)(s2nd))
+	--return(VList (eval a)(eval b))
+eval (Null)=return(VNull)
 eval (Var _) = error "Can't evaluate variables."
-eval (Equal a b)=VB ((eval a)==(eval b))
-eval (Record fields)=VRecord fields
+eval (Equal a b)=do
+	first<-eval a
+	s2nd<-eval b
+	return (VB(first==s2nd))
+eval (Record fields)=return(VRecord fields)
 
---Numerical Functions
-eval (Mul a b) = case(eval a,eval b) of
-					(VN x, VN y) -> VN(x*y)
-					(VTuple(c),VTuple(e))->VTuple(map(eval)(zipWith (Mul) (map (makeExpr)c) (map (makeExpr)e)))
-					(VList c d,VList e f)->VList (eval(Mul (makeExpr c)(makeExpr e))) (eval(Mul (makeExpr d)(makeExpr f)))
-					(VNull,VNull)->VNull 
-					something -> error $"Invalid args for multiplication. We have "++ show something++"."				   
+--Numerical Functions 
+
+eval (Mul a b) = do
+	env <-get
+	case (evalState(eval a) env,evalState(eval b)env) of
+			(VN x, VN y) -> return(VN(x*y))
+			something -> error $"Invalid args for multiplication. We have "++ show something++"."
 					
-eval (Add a b) = case (eval a, eval b) of
-					(VN n, VN m) -> VN (n + m)
-					(VTuple(c),VTuple(e))->VTuple(map(eval)(zipWith (Add) (map (makeExpr)c) (map (makeExpr)e)))
-					(VList c d,VList e f)->VList (eval(Add (makeExpr c)(makeExpr e))) (eval(Add (makeExpr d)(makeExpr f)))
-					(VNull,VNull)->VNull
-					something -> error $ "Invalid args for addition. We have "++ show something++"."
-	
-eval (Sub a b) = case (eval a, eval b) of
-					(VN n, VN m) -> VN (n - m)
-					(VTuple(c),VTuple(e))->VTuple(map(eval)(zipWith (Sub) (map (makeExpr)c) (map (makeExpr)e)))
-					(VList c d,VList e f)->VList (eval(Sub (makeExpr c)(makeExpr e))) (eval(Sub (makeExpr d)(makeExpr f)))
-					(VNull,VNull)->VNull
-					something -> error $ "Subtraction needs two numbers. We have "++ show something++"."
 
-eval (App lam var) = case (eval lam) of
-					VLam(Lam t str body)->  eval$ subst str var body
-					something -> error $"Invalid args for application. We have "++ show something++"."
+eval (Add a b) = do
+	env <-get
+	case (evalState(eval a) env,evalState(eval b)env) of
+			(VN x, VN y) -> return(VN(x+y))
+			something -> error $"Invalid args for multiplication. We have "++ show something++"."
+	
+eval (Sub a b) = do
+	env <-get
+	case (evalState(eval a) env,evalState(eval b)env) of
+			(VN x, VN y) -> return(VN(x-y))
+			something -> error $"Invalid args for multiplication. We have "++ show something++"."	
+
+eval (App lam var) = do
+	env<-get
+	case evalState(eval lam)env of
+					(VLam(Lam t str body))-> eval ( subst str var body)
+					something -> error $"Invalid args for application. We have "++ show something++" as our lambda."
 
 --Boolean Functions					
-eval(If condition thenCase elseCase)=case (eval condition) of
-					VB True->eval(thenCase)
-					VB False->eval(elseCase)
+eval(If condition thenCase elseCase)=do
+	env<-get
+	case evalState(eval condition)env of
+					(VB True)->eval(thenCase) 
+					(VB False)->eval(elseCase)
 					something-> error $"Invalid condition for if. We have "++show something++"."
 
-eval(And a b) = case (eval a, eval b) of
-					(VB x, VB y) -> VB (x && y)
-					(VTuple(c),VTuple(e))->VTuple(map(eval)(zipWith (And) (map (makeExpr)c) (map (makeExpr)e)))
-					(VList c d,VList e f)->VList (eval(And (makeExpr c)(makeExpr e))) (eval(And (makeExpr d)(makeExpr f)))
-					(VNull,VNull)->VNull
-					something -> error $"Inappropriate arguments for and. We have " ++show something ++"."
+eval(And a b) = do
+	env <-get
+	case (evalState(eval a) env,evalState(eval b)env) of
+			(VB x, VB y) -> return(VB(x&&y))
+			something -> error $"Invalid args for multiplication. We have "++ show something++"."	
+						
+eval(Or a b)=do
+	env <-get
+	case (evalState(eval a) env,evalState(eval b)env) of
+			(VB x, VB y) -> return(VB(x||y))
+			something -> error $"Invalid args for multiplication. We have "++ show something++"."
+						
 
-eval(Or a b)=case (eval a, eval b) of
-					(VB x, VB y) -> VB (x|| y)
-					(VTuple(c),VTuple(e))->VTuple(map(eval)(zipWith (Or) (map (makeExpr)c) (map (makeExpr)e)))
-					(VList c d,VList e f)->VList (eval(Or (makeExpr c)(makeExpr e))) (eval(Or (makeExpr d)(makeExpr f)))
-					(VNull,VNull)->VNull
-					something -> error $"Inappropriate arguments for or. We have "++show something++"."
-
-eval(Not a)=case (eval a) of
-				(VB x) -> VB (not(x))
-				(VTuple(c))->VTuple(map(eval)(map(Not) (map makeExpr c)))
-				(VList c d)->VList (eval(Not (makeExpr c))) (eval(Not (makeExpr d)))
-				(VNull)->VNull
-				something -> error $"Inappropriate arguments for not. We have "  ++show something++"."
+eval(Not a)=do
+	env <-get
+	case(evalState(eval a) env) of
+					(VB x)->return(VB(not x))
+					(n)->error $"Attempt to not" ++show a 
 
 --List and pair functions		
-eval(Concat a b)=case (a) of
+eval(Concat a b)=do
+	env <-get
+	case (a) of
 						(Null) -> eval b
-						(List head rest)->eval(List head (makeExpr(eval(Concat rest b))))
+						(List head rest)->eval(List head (makeExpr(evalState(eval(Concat rest b))env)))
 						_ ->error $ "Concat failed. We have "++show (a,b)++"."
-eval(Get index list)=case (eval index) of --Get the indexth member of list.
+eval(Get index list)=do
+	env <-get
+	case evalState(eval index)env of --Get the indexth member of list.
 						(VN num)->if(num<=0) then error "Index out of bounds."
 									else if num==1 
 										then eval(Head list) 
-										else eval(Get (N (num-1)) (makeExpr(eval (Rest(list)))))
-eval(Head (List a _))=eval a --Get the first element in list.
-eval(Head (something))=eval something --I think this executing is a bug.
-eval(Rest (List _ b))=eval b
-eval(GetRec str (Record [(k,v)]))=if(str==k)then eval v else error "Key not found."
-eval(GetRec str (Record ((k,v):record)))=if(str==k)then eval v else eval(GetRec str (Record record))
-eval(LetN ((str,be):more) body)=eval (LetN more (subst str be body))
-eval(LetN [(str,be)] body)=eval (subst str be body)
+										else eval(Get (N (num-1)) (makeExpr(evalState(eval (Rest(list)))env)))
+eval(Head (List a _))=eval a--Get the first element in list.
+eval(Head (something))=eval something--I think this executing is a bug.
+eval(Rest (List _ b))= eval b
+eval(GetRec str (Record [(k,v)]))=if(str==k)then (eval v ) else error "Key not found."
+eval(GetRec str (Record ((k,v):record)))=if(str==k)then eval v  else eval(GetRec str (Record record))
+eval(LetN [(str,be)] body)=eval (subst str be body) 
+eval(LetN ((str,be):more) body)=eval (LetN more (subst str be body)) 
 eval(Fix body) =eval(App body (Fix body))--subst name (Fix name body) body)
-eval(As expr _)=eval expr
-eval(TL a)=eval a
-eval(TR a)=eval a
-eval(Case expr left right)=case(typecheck(makeExpr(eval expr)) []) of
-							(ty)->case(typecheck expr []) of
-								(TSum l r)->if(ty==l)then eval left else if(ty==r)then eval right else error$"Case types unmatching."
-								_ ->error$"Case expr not of sum type."
+eval(As expr _)=eval expr 
+eval(TL a)=do
+	env <-get
+	return(VL(evalState(eval a)env))
+eval(TR a)=do
+	env <-get
+	return(VR(evalState(eval a)env))
+eval(Case expr left right)=do
+	env <-get
+	case evalState(eval expr)env of
+							(VL a)->eval(App left (makeExpr a))
+							(VR b)->eval(App right(makeExpr b))
+							(thing)->error $"Case returned "++show thing++"."
 
-{-case(typecheck(makeExpr(eval expr))) of
-							(left)->eval left
-							(right)->eval right
--}
+eval(Seq [a])=  eval a
+eval(Seq (a:b))=do
+	env<-get
+	put $execState(eval a)env
+	eval (Seq b)
+eval(Set _ name a)=do
+	env<-get
+	put $execState(setHelper(name,evalState(eval a)env))env
+	return VDone
+eval(Lookup str)=do
+	env<-get
+	return $evalState(lookupState str)env
+eval(While guard body)=do
+	env<-get
+	case evalState(eval guard)env of
+								(VB True )->do
+											put $execState(eval body)env
+											eval(While guard body)
+								(VB False)->return(VDone)
+								_-> error$"Do while failure in false."
+eval(Done) =return(VDone)
 eval something = error $"No pattern to evaluate "++show something++"."
+
+{-
+	setHelper::(String,Val)->State Env Bool
+	Redefines the value of a variable in the environment or gives it one if it was previously undefined.
+-}	
+setHelper::(String,Val)->State Env ()
+setHelper (name,val) = do
+	env<-get
+	case env of
+		((s,v):rest)->if(name==s)
+							then put$(name,val):rest
+							else put$(s,v):(execState(setHelper (name,val))rest)
+		[]->put [(name,val)]
+{-
+	lookupState ::String->State Env Val
+	Given the name of a variable either returns its value in the environment or crashes.
+
+-}	
+lookupState ::String->State Env Val
+lookupState st  = do
+	env<-get
+	case env of
+		[]->error $"Variable " ++show st++" not found in environment."
+		((s,v):rest)->if(st==s) then return v else do{return $evalState(lookupState st)rest}
+
 
 {-
 	makeExpr :: Val   ->Expr
@@ -265,6 +429,7 @@ makeExpr(VN a)=(N a)
 makeExpr(VTuple a)= Tuple (map makeExpr a) 
 makeExpr(VLam (Lam t str body))=Lam t str body
 makeExpr(VList a b)=List (makeExpr a)(makeExpr b)
+makeExpr(VRecord stuff)=Record stuff
 makeExpr(VNull)=Null
 --makeExpr(VDone)=Done
 
@@ -276,15 +441,15 @@ n4 = N 123
 
 --List and Pair tests
 
-p1 = Mul (Tuple[(N 2),(N 2)]) (Mul (Tuple[(N 3),(N 4)]) (Tuple[(N 3),(N 4)]))
+-- p1 = Mul (Tuple[(N 2),(N 2)]) (Mul (Tuple[(N 3),(N 4)]) (Tuple[(N 3),(N 4)]))
 p1A= VTuple[(VN 18),(VN 32)]
-p2 = Or(Tuple[(B True),(B False)])(Tuple[(B False),(B False)])
+-- p2 = Or(Tuple[(B True),(B False)])(Tuple[(B False),(B False)])
 p2A= VTuple[(VB True),(VB False)]
 p3 = Equal(Tuple[(N 2),(N 2)])(Tuple[(N 2),(N 2)])
 p4 = Equal(Tuple[(N 2),(N 2)])(Tuple[(N 2),(N 3)])
-p7 = Add (Tuple[(N 2),(N 2)]) (Add (Tuple[(N 3),(N 4)]) (Tuple[(N 3),(N 4)]))
-p8 = Sub (Tuple[(N 2),(N 2)]) (Sub (Tuple[(N 3),(N 4)]) (Tuple[(N 3),(N 4)]))
-p9 = Not(Tuple[B True, B False])
+-- p7 = Add (Tuple[(N 2),(N 2)]) (Add (Tuple[(N 3),(N 4)]) (Tuple[(N 3),(N 4)]))
+-- p8 = Sub (Tuple[(N 2),(N 2)]) (Sub (Tuple[(N 3),(N 4)]) (Tuple[(N 3),(N 4)]))
+--p9 = Not(Tuple[B True, B False])
 
 --Bool tests
 
@@ -323,15 +488,15 @@ s4Q=subst ("x")(N 5) ((Mul (Var  "x")(Var "x")))
 s4A=((Mul (N 5)(N 5)))
 s5Q=subst ("y")(N 12) (If (Equal (N 5)(Var "y"))(Mul (Var "y")(Var "y"))(Add (Var "y")(Var "y")))
 s5A = If(Equal (N 5)(N 12))(Mul (N 12)(N 12))(Add (N 12)(N 12))
-s6Q= subst ("x")(N 4) (Mul (Tuple[(N 2),Var "x"]) (Mul (Tuple[Var "x",(N 4)]) (Tuple[(N 3),Var "x"])))
-s6A= Mul (Tuple [N 2,N 4]) (Mul (Tuple[N 4,N 4])(Tuple[N 3,N 4]))
+--s6Q= subst ("x")(N 4) (Mul (Tuple[(N 2),Var "x"]) (Mul (Tuple[Var "x",(N 4)]) (Tuple[(N 3),Var "x"])))
+--s6A= Mul (Tuple [N 2,N 4]) (Mul (Tuple[N 4,N 4])(Tuple[N 3,N 4]))
 s6Evaled=VTuple[VN 24,VN 64]
-s7Q= subst ("x")(B True) (And (Tuple[(B True),Var "x"]) (And (Tuple[Var "x",(B False)]) (Tuple[(B True),Var "x"])))
-s7A= (And (Tuple[B True,B True]) (And (Tuple[B True,B False]) (Tuple[B True,B True])))
-s7Evaled=VTuple[VB True,VB False]
-s8Q= subst ("x")(B True) (Or (Tuple[(B True),Var "x"]) (Or (Tuple[Var "x",(B False)]) (Tuple[(B True),Var "x"])))
-s8A= (Or (Tuple[B True,B True]) (Or (Tuple[B True,B False]) (Tuple[B True,B True])))
-s8Evaled=VTuple[VB True,VB True]
+--s7Q= subst ("x")(B True) (And (Tuple[(B True),Var "x"]) (And (Tuple[Var "x",(B False)]) (Tuple[(B True),Var "x"])))
+--s7A= (And (Tuple[B True,B True]) (And (Tuple[B True,B False]) (Tuple[B True,B True])))
+-- s7Evaled=VTuple[VB True,VB False]
+-- s8Q= subst ("x")(B True) (Or (Tuple[(B True),Var "x"]) (Or (Tuple[Var "x",(B False)]) (Tuple[(B True),Var "x"])))
+-- s8A= (Or (Tuple[B True,B True]) (Or (Tuple[B True,B False]) (Tuple[B True,B True])))
+-- s8Evaled=VTuple[VB True,VB True]
 s9=subst ("x")(B True) ((Not (Var  "x")))
 s9A=Not (B True)
 s10 = subst ("x")(N 3) (Get (Var "x")(List (N 1) (List (N 2)(List (Var "x")(Null)))))
@@ -354,13 +519,13 @@ t8 = List(N 5)(List (N 1)(Null))
 t9 = Lam (TList TNum 3) "x" (Equal (Var "x")(List (N 1) (List (N 3)(List (N 2)(Null)))))
 t10 = Get (N 3)(List (N 1) (List (N 2)(List (N 3)(Null))))
 t11 = Rest (List (N 1) (List (N 1)(Null)))
-t12 = Mul t8 t8
-t13 = Add t8 t8
-t14 = Sub t8 t8
-t15 = List(B True)(List (B False)(Null))
-t16 = And t15 t15
-t17 = Not t15
-t18 = Or t15 t17
+--t12 = Mul t8 t8
+--t13 = Add t8 t8
+--t14 = Sub t8 t8
+--t15 = List(B True)(List (B False)(Null))
+--t16 = And t15 t15
+--t17 = Not t15
+--t18 = Or t15 t17
 
 --Expressions that return a value but fail typechecking.
 maybe1 = If(B True)(N 4)(B True)--Mixing types in if statements.
@@ -368,26 +533,40 @@ maybe2 = If(B False)(N 4)(B True)--Mixing types in if statements.
 maybe3 = Concat(List (N 5)(Null))(List (B True)(Null)) --Mixing types in lists.
 maybe3Ans= VList (VN 5)(VList (VB True)(VNull))
 maybe4 =App(Lam TBool "x" (If (B True)(N 5)(N 6)))(N 5) --Input to lambda is of wrong type.
-maybe5=Case(sum1)(N 0)(B True)
+maybe5=Case(sum1)(Lam TNum "x" (Var "x"))(Lam TBool "x" (Var "x"))
 
 --Expressions that crash and fail typechecking.
 fail1 = If(N 5)(N 4)(N 3)
 fail2 = And (N 5)(B True)
 fail3 = Case(N 5)(N 4)(N 3)
 
+--Record tests
+rec1=Record[("age",N 18),("shoe-size",N 14)]
+rec2=GetRec "shoe-size" rec1
+
 --SumTests
 sum1=If(B True)(As (TL (N 5))(TSum TNum TBool))(As (TR (B True))(TSum TNum TBool))
 sum2=If(B False)(As (TL (N 5))(TSum TNum TBool))(As (TR (B True))(TSum TNum TBool))
-case1=Case(sum1)(N 0)(N 1)
-case2=Case(sum2)(N 0)(N 1)
+case1=Case(sum1)(Lam TNum "x" (Var "x"))(Lam TBool "x" (If(Var "x")(N 4)(N 3)))
+case2=Case(sum2)(Lam TNum "x" (Var "x"))(Lam TBool "x" (If(Var "x")(N 4)(N 3)))
+sum2Point5=(If(Var "x")(As (TL (If(Var "x")(N 5)(N 4)))(TSum TNum TBool))(As (TR (Var "x"))(TSum TNum TBool)))
+sum3=Lam TBool "x" sum2Point5
+sum4=App sum3 (B True)
+sum5=App sum3 (B False)
+case3=Case(sum4)(Lam TNum "x" (Var "x"))(Lam TBool "x" (If(Var "x")(N 4)(N 3)))
+case4=Case(sum5)(Lam TNum "x" (Var "x"))(Lam TBool "x" (If(Var "x")(N 4)(N 3)))
 
+--SeqTests
+while1=While(B True)(N 3)
+assign1=Seq[Set TNum "x" (N 1),Lookup "x"]
+assign2=Seq[Set TNum "x" (N 1),Set TNum "y" (N 2),Lookup "x"]
 
 -- tests paired with their expected answers
 numTests = [(n1,VN 20),(n2,VN 14),(n3,VN 1),(n4,VN 123) ,(s4A,VN 25),
-			(s5A,VN 24),(s6A,s6Evaled),(maybe1,(VN 4)),(maybe2,(VB True)),
+			(s5A,VN 24),(maybe1,(VN 4)),(maybe2,(VB True)), --(s6A,s6Evaled),
 			(maybe3,maybe3Ans),(maybe4,VN 5)]
 
-pairTests=[(p1,p1A),(p2,p2A),(p3,VB True),(p4,VB False)]
+pairTests=[(p3,VB True),(p4,VB False)]--(p1,p1A),(p2,p2A),
 
 boolTests=[(b1,VB True),(b2,VB False),(b3,VB True),(b4,VB False)
 			,(b5,VB True),(b6,VB False),(b7,VB False),(b8,VB True)
@@ -395,21 +574,22 @@ boolTests=[(b1,VB True),(b2,VB False),(b3,VB True),(b4,VB False)
 			,(t5,VB False)]
 			
 execTests=[(n1,VN 20),(n2,VN 14),(n3,VN 1),(n4,VN 123) ,(s4A,VN 25),
-			(s5A,VN 24),(s6A,s6Evaled)
-			,(f1,f1A),(f2,VN 5),(f3,f3A),(f5,f5A)
+			(s5A,VN 24) -- ,(s6A,s6Evaled)
+			,(f1,f1A),(f2,VN 5),(f5,f5A)
 			,(f6,VN 25),(t4,VB True),(t5,VB False),(t6,(VList (VN 5)(VList (VN 1)(VNull))))
 			,(t8,VList (VN 5)(VList (VN 1)(VNull)))
 			,(t9, VLam (Lam (TList TNum 3) "x" (Equal (Var "x")(List (N 1) (List (N 3)(List (N 2)(Null)))))))
-			,(t10,VN 3),(t11,VList (VN 1)(VNull)),(t12,VList (VN 25)(VList (VN 1)(VNull))),(t13,VList (VN 10)(VList (VN 2)(VNull)))
-			,(t14,VList (VN 0)(VList (VN 0)(VNull))),(t15,VList (VB True)(VList (VB False)(VNull)))
-			,(t16,VList (VB True)(VList (VB False)(VNull))),(t17,VList (VB False)(VList (VB True)(VNull))),(t18,VList (VB True)(VList (VB True)(VNull)))
-			,(s7A,VTuple[VB True,VB False]),(p7,VTuple[VN 8,VN 10]),(p8,VTuple[VN 2,VN 2])
-			,(p9,VTuple[VB False,VB True]),(s8A,s8Evaled),(sum1,VN 5),(sum2,VB True),(case1,VN 0),(case2,VN 1)]
+			,(t10,VN 3),(t11,VList (VN 1)(VNull))--,(t12,VList (VN 25)(VList (VN 1)(VNull))),(t13,VList (VN 10)(VList (VN 2)(VNull)))
+			--,(t14,VList (VN 0)(VList (VN 0)(VNull))),(t15,VList (VB True)(VList (VB False)(VNull)))
+			--,(t16,VList (VB True)(VList (VB False)(VNull))),(t17,VList (VB False)(VList (VB True)(VNull))),(t18,VList (VB True)(VList (VB True)(VNull)))
+			--,(p7,VTuple[VN 8,VN 10]),(p8,VTuple[VN 2,VN 2]) --,(s7A,VTuple[VB True,VB False])
+			,(sum1,VL(VN 5)),(sum2,VR(VB True)),(case1,VN 5),(case2,VN 4),(rec1,VRecord[("age",N 18),("shoe-size",N 14)])
+			,(rec2,VN 14),(App fibonacci (N 4),VN 3),(sum4,VL(VN 5)),(sum5,VR(VB False)),(case3,VN 5),(case4,VN 3)] --(s8A,s8Evaled),(p9,VTuple[VB False,VB True]),
 			
 funcTests=[(f1,f1A),(f2,VN 5),(f3,f3A),(f5,f5A)
 			,(f6,VN 25)]
 		
-subTests=[(s1Q,s1A),(s2Q,s2A),(s3Q,s3A),(s4Q,s4A),(s5Q,s5A),(s6Q,s6A),(s7Q,s7A),(s8Q,s8A),
+subTests=[(s1Q,s1A),(s2Q,s2A),(s3Q,s3A),(s4Q,s4A),(s5Q,s5A), --(s6Q,s6A),(s7Q,s7A),(s8Q,s8A),
 		   (s9,s9A),(s10,s10A),(s11,s11A),(s12,s12A),(s13,s13A)]
 
 typeTests=[ (n1,TNum),(n2,TNum),(n3,TNum),(n4,TNum),(b1,TBool),
@@ -417,30 +597,49 @@ typeTests=[ (n1,TNum),(n2,TNum),(n3,TNum),(n4,TNum),(b1,TBool),
 			(b7,TBool),(b8,TBool),(b9,TBool),(b10,TBool),(b11,TBool),
 			(b12,TBool),(f1,TNum :-> TNum),(f2,TNum),(t1,TBool :-> TNum),
 			(t2,TNum),(t3,TNum :-> (TBool :-> TNum)),(t4,TBool),(Null,TNull),
-			(s7A,TTuple [TBool,TBool]),(t11,TList TNum 1),(sum1,TSum TNum TBool),
-			(sum2,TSum TNum TBool),(case1,TNum),(case2,TNum)]
+			(t6,TList TNum 2),(t10,TNum),(t11,TList TNum 1),(sum1,TSum TNum TBool), --(s7A,TTuple [TBool,TBool]),
+			(sum2,TSum TNum TBool),(case1,TNum),(case2,TNum),(factorial,(TNum :->TNum):->(TNum:->TNum)),
+			(Tuple [N 3,N 2, B True],TTuple[TNum,TNum,TBool]),(s11A,TNum),(run,TNum),
+			(while1,TDone),(assign1,TNum)]
 
 -- are tests paired up with their actual results?
-test_results = map (\(t,v)-> eval t==v) numTests
-pairTestResults = map (\(t,v)-> eval t==v) pairTests
-boolTestResults = map (\(t,v)-> eval t==v) boolTests
-funcTestResults = map (\(t,v)-> eval t==v) funcTests
-execTestResults = map (\(t,v)-> exec t==v) execTests
-subTestResults = map (\(t,v)-> t==v) subTests
-typeTestResults = map (\(t,v)-> typecheck t []==v) typeTests
+testResults = map (\(t,v)-> evalState(eval t)[]==v) numTests
+----fst and snd
+pairTestResults = map (\(t,v)-> evalState(eval t)[]==v) pairTests
+boolTestResults = map (\(t,v)-> evalState(eval t)[]==v) boolTests
+funcTestResults = map (\(t,v)-> evalState(eval t)[]==v) funcTests
+execTestResults = map (\(t,v)-> (exec t)==v) execTests
+subTestResults  = map (\(t,v)-> t==v) subTests
+typeTestResults = map (\(t,v)-> evalState(typecheck t)[]==v) typeTests
 
--- ###This works correctly but doesn't use fix.
---factorial = (Lam TNum "x" (Fix "fac"(If (Equal (Var "x")(N 1))(N 1)(Mul (Var "x")(App(factorial) (Sub (Var "x") (N 1))))))) 
---run=App factorial (N 2)
--- ###This runs infinitely for inputs greater than 1.
---factorial = (Lam TNum "x" (Fix "fac"(If (Equal (Var "x")(N 1))(N 1)(Mul (Var "x")(App(Lam TNum "x"(Func "fac")) (Sub (Var "x") (N 1))))))) 
---run=App factorial (N 2)
--- ###This crashes for inputs greater than 1.
+
 factorial = Fix (Lam (TNum :-> TNum)"fac"(Lam TNum "x" ((If (Equal (Var "x")(N 1))(N 1)(Mul (Var "x")(App((Var "fac")) (Sub (Var "x") (N 1))))))) )
-run=App factorial (N 3)
---step1=Fix ("fac" (If (Equal(N 2)(N 1))(N 1)(Mul (N 2)(App (Var "fac")(Sub (N 2)(N 1))))))
+run=App factorial (N 4)
+fibonacci=Lam (TNum) "limit" 
+	(Seq[Set TNum "x0" (N 0),
+		Set TNum "x1" (N 1),
+		Set TNum "count" (N 0),
+		While(Not(Equal (Lookup "count")(Var "limit")))
+		(Seq [
+			Set TNum "x0"(Add(Lookup "x0")(Lookup "x1")),
+			Set TNum "x1"(Sub(Lookup "x0")(Lookup "x1")),
+			Set TNum "count" (Add(Lookup "count")(N 1))
+			]),
+		Lookup "x0"
+	])
+	
+maybeWhile=Seq[Set TNum "cnt" (N 0) ,
+		While(Not(Equal (Lookup "cnt")(N 2)))
+		(Seq [
+			If(Equal (Lookup "cnt")(N 1)) (Lookup "x")(N 0),
+			If(Equal (Lookup "cnt")(N 0)) (Set TNum "x" (N 0))(Done),
+			Set TNum "cnt" (Add(Lookup "cnt")(N 1))
+			])	
+			]
 -- were all tests okay?
-okay = (and test_results)&&(and boolTestResults)  &&  (and subTestResults)  &&  (and funcTestResults)  && (and typeTestResults)  &&(and pairTestResults) &&(and execTestResults)
+okay = (and testResults)&&(and boolTestResults)  &&  (and subTestResults)  &&  (and funcTestResults)  && (and typeTestResults)  &&(and pairTestResults) &&(and execTestResults)
 
 main = do
+	putStrLn (show(evalState(eval (App factorial (N 3)))[]))
+	putStrLn (show(evalState(eval (App fibonacci (N 4)))[]))
 	putStrLn("okay is " ++show okay)
