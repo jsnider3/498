@@ -1,31 +1,44 @@
---Changes since Project 6.5
---Perfect Typechecking for Records
---Distinguish between TReal and TInt
---Add subtype::Type->Type->Bool method and commonType
---In a lot of scenarios, typecheck will now return Top as the return type of an expression instead of crashing.
-	--This indicates that that's the smallest Type which contains all of the possible values.
+--Changes planned
+--	GetRec should update the value if its not simple.
+--	Chars 
+--	Add print function
+--	Allow types to be strings which map to more defined types
+--	typedef should allow type strings to be defined
+--	Allow declaring variables.
+--		Not sure if declaration should be strict or not.
+--		Strict is more formal, but slightly trickier.
+--Next project will be making the language pretty. 
+
+--Changes made (not yet tested)
+--	Working on it.
 import Control.Parallel
 import Control.Monad.State
 import Data.List
 import qualified Data.Map as Map
 data Expr= N Int | F Float| Add Expr Expr | Mul Expr Expr | Sub Expr Expr
-	   | And Expr Expr | Or Expr Expr |Not Expr |If Expr Expr Expr |Equal Expr Expr| B Bool
-	   | Lam Type String Expr | App Expr Expr | Var String |Tuple[Expr]
-	   |List Expr Expr 
-	   |Null --Null is the Unit Type
-	   |Done
-	   |Concat Expr Expr |Get Expr Expr |Head Expr |Rest Expr
-	   |Record [(String,Expr)] |GetRec String Expr 
-	   |Fix Expr|LetN[(String,Expr)] Expr  
-	   |TL Expr| TR Expr| Case Expr Expr Expr |As Expr Type 
-	   |Seq [Expr] |Set Type String Expr |Lookup String |While Expr Expr
-	   |Top|Bottom
-           deriving(Show,Eq)
+		| And Expr Expr | Or Expr Expr |Not Expr |If Expr Expr Expr |Equal Expr Expr| B Bool
+		| Lam Type String Expr | App Expr Expr | Var String |Tuple[Expr]
+		|List Expr Expr 
+		|Null --Null is the Unit Type
+		|Done
+		|Concat Expr Expr |Get Expr Expr |Head Expr |Rest Expr
+		|Record [(String,Expr)] |GetRec String Expr 
+		|Fix Expr|LetN[(String,Expr)] Expr  
+		|TL Expr| TR Expr| Case Expr Expr Expr |As Expr Type 
+		|Seq [Expr] |Set Type String Expr |Lookup String |While Expr Expr
+		|Top|Bottom
+		|Print Expr
+		-- |C Char
+		-- |Typedef TStr Type
+		-- |Declare Type String
+			deriving(Show,Eq)
 		   
-data Type = TInt | TReal |TBool | Type :-> Type  |TTuple [Type] | TyL Type | TyR Type |TList Type Int |TRecord[(String,Type)]|TNull |TSum Type Type|TDone|TTop|TBottom
+data TStr=String
+data Type = TInt | TReal |TBool | TChar |Type :-> Type  |TTuple [Type] | TyL Type | TyR Type |TList Type Int |TRecord[(String,Type)]|TNull |TSum Type Type|TDone|TTop|TBottom
+	-- |TStr
 		deriving (Show, Eq)
 
-data Val = VB Bool | VTuple [Val] | VList Val Val |VNull | VL Val |VR Val|VDone|
+data Val = VB Bool | VC Char | VTuple [Val] | VList Val Val |VNull | VL Val |VR Val|VDone|
 			VN Int |VF Float| VLam Expr |VRecord [(String,Expr)]|VTop|VBottom deriving (Show, Eq) --There's no VApp because applications can always be reduced further.
 
 type Dict a  b =Map.Map a b
@@ -39,6 +52,7 @@ type TEnv=Dict String Type --deriving(Show,Eq)
 	a value of a single type or  returns an error.
 -}			
 typecheck ::Expr->State TEnv Type --[(String,Type)]->([(String,Type)],Type)
+typecheck (C _)=return TChar
 typecheck (N _)=return TInt
 typecheck (F _)=return TReal
 typecheck (B _)=return TBool
@@ -152,6 +166,10 @@ typecheck(Record fields)= do
 	return(TRecord $ zip(map fst fields)((zipWith evalState(map typecheck(map snd fields))(replicate (length fields)env))))
 typecheck(GetRec str (Record[(k,v)]))=if(k==str)then typecheck v  else error $"Record doesn't possess the specified field."
 typecheck(GetRec str (Record((k,v):record)))=if(k==str)then typecheck v  else typecheck(GetRec str (Record record))
+--typecheck(Typedef s t)=error $"Not yet implemented."
+						--Add the typedef to some kind of thing.
+typecheck(Print s)=case typecheck(s) of
+					
 typecheck something = error $"Can't typecheck "++show something
 
 {-
@@ -285,6 +303,7 @@ eval :: Expr -> State Env Val
 
 eval (N a) = return (VN a)
 eval (F a) = return (VF a)
+eval (C a) = return (VC a)
 eval (Tuple a)=do
 	env<-get
 	return(VTuple (zipWith (evalState)(map eval a)(replicate (length a)env )))
